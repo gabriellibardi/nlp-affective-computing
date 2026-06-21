@@ -18,6 +18,8 @@
 # %%
 from pathlib import Path
 
+from collections import Counter
+
 from src.pdf_reader import extract_text_from_pdf
 from src.preprocessing import (
     clean_text,
@@ -100,3 +102,7 @@ print(text_without_references)
 tokens = dict_process(text_without_references, tokenize)
 tokens = dict_process(tokens, remove_stopwords)
 lemmatized_tokens = dict_process(tokens, lemmatize_tokens)
+
+# %%
+all_lemmatized_tokens = [t for token_list in lemmatized_tokens.values() for t in token_list]
+print(Counter(all_lemmatized_tokens).most_common(10))
