@@ -6,7 +6,7 @@ from preprocessing import (
     remove_references,
     tokenize,
     remove_stopwords,
-    stem_tokens,
+    lemmatize_tokens,
 )
 
 
@@ -60,7 +60,7 @@ def main() -> None:
     - Lê PDFs de data/raw.
     - Salva textos limpos em data/processed.
     - Salva textos sem referências em data/no_references.
-    - Tokeniza, remove stopwords e aplica stemming.
+    - Tokeniza, remove stopwords e aplica lemmatizing.
     """
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
     NO_REFERENCES_DIR.mkdir(parents=True, exist_ok=True)
@@ -79,11 +79,11 @@ def main() -> None:
 
         tokens = tokenize(text_without_references)
         tokens = remove_stopwords(tokens)
-        stemmed_tokens = stem_tokens(tokens)
+        lemmatized_tokens = lemmatize_tokens(tokens)
 
         print(f"\n{pdf_path.stem}")
-        print(f"Tokens após stemming: {len(stemmed_tokens)}")
-        print(stemmed_tokens[:50])
+        print(f"Tokens após lemmatizing: {len(lemmatized_tokens)}")
+        print(lemmatized_tokens[:50])
 
 
 if __name__ == "__main__":

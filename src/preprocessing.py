@@ -1,9 +1,9 @@
 import re
 import nltk
 from nltk.corpus import stopwords
-from nltk.stem import PorterStemmer
+from nltk.stem import WordNetLemmatizer
 
-stemmer = PorterStemmer()
+lemmatizer = WordNetLemmatizer()
 
 
 def get_stopwords() -> set[str]:
@@ -72,8 +72,8 @@ def remove_stopwords(tokens: list[str]) -> list[str]:
     ]
 
 
-def stem_tokens(tokens: list[str]) -> list[str]:
+def lemmatize_tokens(tokens: list[str]) -> list[str]:
     """
     Aplica stemming nos tokens usando PorterStemmer.
     """
-    return [stemmer.stem(token) for token in tokens]
+    return [lemmatizer.lemmatize(token) for token in tokens]
