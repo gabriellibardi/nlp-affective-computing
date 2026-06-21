@@ -1,3 +1,5 @@
+*.ipynb
+
 data/processed/
 data/no_references/
 
