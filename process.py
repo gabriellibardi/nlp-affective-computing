@@ -17,7 +17,6 @@
 
 # %%
 from pathlib import Path
-
 from collections import Counter
 
 from src.pdf_reader import extract_text_from_pdf
@@ -28,18 +27,26 @@ from src.preprocessing import (
     remove_stopwords,
     lemmatize_tokens,
 )
+from src.extraction import extract_information_for_corpus
+
 
 def dict_process(target: dict, process):
     return {key: process(value) for key, value in target.items()}
+
 
 RAW_DIR = Path("./data/raw")
 PROCESSED_DIR = Path("./data/processed")
 NO_REFERENCES_DIR = Path("./data/no_references")
 
+PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+NO_REFERENCES_DIR.mkdir(parents=True, exist_ok=True)
+
 pdf_files = list(RAW_DIR.glob("*.pdf"))
+
 print(f"{len(pdf_files)} artigos encontrados")
 
-def get_processed_text(pdf_path: Path, raw_text: str=None) -> str:
+
+def get_processed_text(pdf_path: Path, raw_text: str | None = None) -> str:
     """
     Obtém o texto limpo de um PDF.
 
@@ -51,18 +58,24 @@ def get_processed_text(pdf_path: Path, raw_text: str=None) -> str:
     if output_path.exists():
         return output_path.read_text(encoding="utf-8")
 
-    if raw_text == None:
+    if raw_text is None:
         raw_text = extract_text_from_pdf(pdf_path)
+
     processed_text = clean_text(raw_text)
 
     output_path.write_text(processed_text, encoding="utf-8")
 
     return processed_text
 
-def process_text(pdf_path: Path, raw_text:str) -> str:
+
+def process_text(pdf_path: Path, raw_text: str) -> str:
     return get_processed_text(pdf_path, raw_text=raw_text)
 
-def get_text_without_references(pdf_path: Path, processed_text: str=None) -> str:
+
+def get_text_without_references(
+    pdf_path: Path,
+    processed_text: str | None = None,
+) -> str:
     """
     Obtém o texto sem referências bibliográficas.
 
@@ -74,15 +87,17 @@ def get_text_without_references(pdf_path: Path, processed_text: str=None) -> str
     if output_path.exists():
         return output_path.read_text(encoding="utf-8")
 
-    if processed_text == None:
-        get_processed_text(pdf_path)
+    if processed_text is None:
+        processed_text = get_processed_text(pdf_path)
+
     text_without_references = remove_references(processed_text)
 
     output_path.write_text(text_without_references, encoding="utf-8")
 
     return text_without_references
 
-def remove_text_references(pdf_path: Path, processed_text):
+
+def remove_text_references(pdf_path: Path, processed_text: str) -> str:
     return get_text_without_references(pdf_path, processed_text=processed_text)
 
 
@@ -90,13 +105,24 @@ def remove_text_references(pdf_path: Path, processed_text):
 # ### Raw file reading and preprocessing
 
 # %%
-processed_text = {path: get_processed_text(path) for path in pdf_files}
+processed_text = {
+    path: get_processed_text(path)
+    for path in pdf_files
+}
 
 # %%
-text_without_references = {path: get_text_without_references(path) for path in pdf_files}
+text_without_references = {
+    path: get_text_without_references(path, processed_text[path])
+    for path in pdf_files
+}
 
 # %%
-print(text_without_references)
+for path, text in text_without_references.items():
+    print("=" * 100)
+    print(path.stem)
+    print("=" * 100)
+    print(text[:1000])
+    print()
 
 # %%
 tokens = dict_process(text_without_references, tokenize)
@@ -104,5 +130,72 @@ tokens = dict_process(tokens, remove_stopwords)
 lemmatized_tokens = dict_process(tokens, lemmatize_tokens)
 
 # %%
-all_lemmatized_tokens = [t for token_list in lemmatized_tokens.values() for t in token_list]
+all_lemmatized_tokens = [
+    token
+    for token_list in lemmatized_tokens.values()
+    for token in token_list
+]
+
 print(Counter(all_lemmatized_tokens).most_common(10))
+
+
+# %% [markdown]
+# ### Etapa 2 - Extração de objetivo, problema, método e contribuição
+#
+# Nesta etapa, são extraídos trechos candidatos para:
+#
+# - objetivo do artigo;
+# - problema ou lacuna de pesquisa;
+# - método ou metodologia;
+# - contribuição do artigo.
+#
+# A extração é feita sobre o texto sem referências, mas antes da tokenização,
+# para preservar as sentenças originais.
+
+# %%
+step2_extractions = extract_information_for_corpus(text_without_references)
+
+
+# %% [markdown]
+# ### Visualização das extrações da Etapa 2
+
+# %%
+for article_name, extraction in step2_extractions.items():
+    print("=" * 100)
+    print(f"ARTIGO: {article_name}")
+    print("=" * 100)
+
+    print("\nOBJETIVO:")
+    if extraction["objective"]:
+        for item in extraction["objective"]:
+            print(f"- {item}")
+    else:
+        print("- Não encontrado automaticamente.")
+
+    print("\nPROBLEMA:")
+    if extraction["problem"]:
+        for item in extraction["problem"]:
+            print(f"- {item}")
+    else:
+        print("- Não encontrado automaticamente.")
+
+    print("\nMÉTODO / METODOLOGIA:")
+    if extraction["method"]:
+        for item in extraction["method"]:
+            print(f"- {item}")
+    else:
+        print("- Não encontrado automaticamente.")
+
+    print("\nCONTRIBUIÇÃO:")
+    if extraction["contribution"]:
+        for item in extraction["contribution"]:
+            print(f"- {item}")
+    else:
+        print("- Não encontrado automaticamente.")
+
+    if extraction["review_notes"]:
+        print("\nAVISOS PARA REVISÃO MANUAL:")
+        for note in extraction["review_notes"]:
+            print(f"- {note}")
+
+    print()

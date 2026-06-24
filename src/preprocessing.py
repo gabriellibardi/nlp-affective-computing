@@ -74,6 +74,6 @@ def remove_stopwords(tokens: list[str]) -> list[str]:
 
 def lemmatize_tokens(tokens: list[str]) -> list[str]:
     """
-    Aplica stemming nos tokens usando PorterStemmer.
+    Aplica lematização nos tokens usando WordNetLemmatizer.
     """
     return [lemmatizer.lemmatize(token) for token in tokens]
