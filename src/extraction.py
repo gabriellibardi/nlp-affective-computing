@@ -1,152 +1,140 @@
 """
-Extraction rules for Step 2 of the scientific article analysis work.
+Extração simples de informações de artigos científicos.
 
-This module extracts candidate excerpts for:
-- objective
-- problem
-- method / methodology
-- contribution
+Comportamento inspirado no arquivo de referência:
+1. separa referências;
+2. divide o artigo em regiões aproximadas;
+3. divide em frases;
+4. busca trechos por padrões;
+5. retorna listas de trechos literais.
 
-The implementation is intentionally based on regular expressions and simple
-heuristics, without pretrained models or machine learning libraries.
+Não utiliza modelos pré-treinados nem bibliotecas de machine learning.
 """
 
-from __future__ import annotations
-
 import re
-from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable, Mapping
+from typing import Mapping
 
-@dataclass
-class ExtractedArticleInfo:
-    """
-    Information extracted from one scientific article.
+# Texto e frases
 
-    The fields are lists because an article may contain more than one good
-    candidate sentence for the same category.
-    """
+SPACE_RE = re.compile(r"\s+")
 
-    article: str
-    objective: list[str]
-    problem: list[str]
-    method: list[str]
-    contribution: list[str]
-    review_notes: list[str]
+ABBREVIATIONS = [
+    "e.g.", "i.e.", "et al.", "etc.", "vs.",
+    "Fig.", "Eq.", "Sec.", "Dr.", "Prof.", "No.",
+]
 
+def normalize_text(text: str) -> str:
+    """Normaliza espaços duplicados"""
+    return SPACE_RE.sub(" ", text or "").strip()
 
-# ---------------------------------------------------------------------------
-# Text normalization and sentence handling
-# ---------------------------------------------------------------------------
-
-def normalize_spaces(text: str) -> str:
-    """
-    Normalize whitespace produced during PDF extraction.
-    """
-    return re.sub(r"\s+", " ", text or "").strip()
-
-
-def split_sentences(text: str) -> list[str]:
-    """
-    Split text into sentences using a lightweight regex heuristic.
-
-    This avoids depending on sentence tokenizers or pretrained NLP models.
-    It is not perfect, but works reasonably well for scientific articles.
-    """
-    text = normalize_spaces(text)
+def split_text(text: str) -> list[str]:
+    """Divide texto em frases protegendo abreviações comuns"""
+    text = normalize_text(text)
 
     if not text:
         return []
 
-    raw_sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9\"'])", text)
-    sentences: list[str] = []
+    protected = text
+    placeholders = {}
+
+    for i, abbr in enumerate(ABBREVIATIONS):
+        token = f"@@ABBR{i}@@"
+        placeholders[token] = abbr
+        protected = re.sub(re.escape(abbr), token, protected, flags=re.IGNORECASE)
+
+    raw_sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9(\"'])", protected)
+
+    sentences = []
 
     for sentence in raw_sentences:
-        sentence = sentence.strip()
+        for token, abbr in placeholders.items():
+            sentence = sentence.replace(token, abbr)
 
-        # Very short strings are usually headings, captions or extraction noise.
-        if len(sentence) < 45:
-            continue
+        sentence = normalize_text(sentence)
 
-        # Very long strings usually indicate that the PDF extraction merged
-        # multiple sections into one sentence.
-        if len(sentence) > 900:
-            continue
-
-        sentences.append(sentence)
+        if 35 <= len(sentence) <= 1100 and not is_noise_sentence(sentence):
+            sentences.append(sentence)
 
     return sentences
 
+def is_noise_sentence(sentence: str) -> bool:
+    """Remove frases claramente vindas de cabeçalho, rodapé ou copyright"""
+    lower = sentence.lower()
 
-def sentence_terms(sentence: str) -> set[str]:
-    """
-    Return relevant lowercase terms from a sentence.
-    """
-    return set(re.findall(r"[a-zA-Z]{3,}", sentence.lower()))
+    noise = [
+        "permission to make",
+        "copyright",
+        "all rights reserved",
+        "publication date",
+        "pacm on human-computer interaction",
+        "acm reference format",
+        "doi.org",
+    ]
 
+    return any(item in lower for item in noise)
 
-def jaccard_similarity(a: str, b: str) -> float:
-    """
-    Compare two sentences using Jaccard similarity over word sets.
-    """
-    terms_a = sentence_terms(a)
-    terms_b = sentence_terms(b)
+def make_excerpt(sentences: list[str], index: int) -> str:
+    """Retorna a frase encontrada junto com a próxima, quando couber"""
+    excerpt = sentences[index]
 
-    if not terms_a or not terms_b:
-        return 0.0
+    if index + 1 < len(sentences):
+        next_sentence = sentences[index + 1]
 
-    return len(terms_a & terms_b) / len(terms_a | terms_b)
+        if len(excerpt) + len(next_sentence) <= 900:
+            excerpt = f"{excerpt} {next_sentence}"
 
+    return excerpt
 
-def append_if_unique(
-    selected: list[str],
-    candidate: str,
-    limit: int,
-    similarity_threshold: float = 0.62,
-) -> None:
-    """
-    Append a sentence only if it is not too similar to selected sentences.
-    """
-    if len(selected) >= limit:
-        return
+# Referências
 
-    for sentence in selected:
-        if jaccard_similarity(sentence, candidate) >= similarity_threshold:
-            return
+REFERENCE_HEADING_RE = re.compile(r"\b(?:references|bibliography|acm references|literature cited)\b", re.IGNORECASE)
 
-    selected.append(candidate)
+def clean_reference(reference: str) -> str:
+    """Limpa marcador inicial e pequenos ruídos de referência"""
+    reference = normalize_text(reference)
+    reference = re.sub(r"^\s*(?:\[\d+\]|\(\d+\)|\d+\.)\s*", "", reference)
 
+    reference = re.sub(
+        r"PACM on Human-Computer Interaction.*?Publication date:\s*[A-Za-z]+\s+\d{4}\.?",
+        " ",
+        reference,
+        flags=re.IGNORECASE,
+    )
 
-# ---------------------------------------------------------------------------
-# Section detection
-# ---------------------------------------------------------------------------
+    return normalize_text(reference)
 
-INTRODUCTION_HEADINGS = [
-    "introduction",
-]
+def split_references(text: str) -> tuple[str, list[str]]:
+    """Separa corpo do artigo e referências"""
+    text = normalize_text(text)
+    matches = list(REFERENCE_HEADING_RE.finditer(text))
 
-METHOD_HEADINGS = [
-    "method",
-    "methods",
-    "methodology",
-    "materials and methods",
-    "approach",
-    "proposed approach",
-    "proposed method",
-    "study design",
-    "experimental setup",
-    "experiment",
-    "experiments",
-]
+    if not matches:
+        return text, []
 
-CONCLUSION_HEADINGS = [
-    "discussion",
-    "conclusion",
-    "conclusions",
-    "final remarks",
-]
+    # Evita pegar "references" citado cedo demais
+    half = len(text) * 0.5
+    match = next((m for m in matches if m.start() > half), matches[-1])
 
-COMMON_NEXT_HEADINGS = [
+    body = text[: match.start()].strip()
+    refs_text = text[match.end():].strip()
+
+    if not refs_text:
+        return body, []
+
+    parts = re.split(r"(?=(?:\[\d{1,3}\]|\b\d{1,3}\.\s+[A-Z]))", refs_text)
+
+    references = [
+        clean_reference(part)
+        for part in parts
+        if len(clean_reference(part)) > 35
+    ]
+
+    return body, references if references else [clean_reference(refs_text)]
+
+# seções
+
+HEADINGS = [
     "abstract",
     "keywords",
     "introduction",
@@ -159,371 +147,313 @@ COMMON_NEXT_HEADINGS = [
     "materials and methods",
     "approach",
     "proposed approach",
-    "proposed method",
-    "study design",
-    "experimental setup",
     "experiment",
     "experiments",
+    "experimental setup",
     "results",
-    "findings",
-    "discussion",
     "evaluation",
-    "limitations",
+    "discussion",
     "conclusion",
     "conclusions",
-    "acknowledgements",
-    "acknowledgments",
+    "final remarks",
     "references",
-    "bibliography",
 ]
 
+def heading_regex(headings: list[str]) -> re.Pattern:
+    escaped = [re.escape(h) for h in sorted(headings, key=len, reverse=True)]
 
-def _heading_regex(headings: Iterable[str]) -> str:
-    """
-    Build a regex that finds section titles with optional numbering.
-    """
-    escaped = [re.escape(h) for h in headings]
-
-    return (
+    return re.compile(
         r"(?:^|\s)"
         r"(?:\d+(?:\.\d+)*\.?\s*)?"
-        r"("
-        + "|".join(escaped)
-        + r")"
-        r"(?:\s|$|[:.])"
+        r"(?:" + "|".join(escaped) + r")"
+        r"(?:\s|:|\.)",
+        re.IGNORECASE,
     )
 
 
-def find_heading(text: str, headings: Iterable[str], start: int = 0) -> re.Match[str] | None:
-    """
-    Find the first heading occurrence after a given position.
-    """
-    return re.search(_heading_regex(headings), text[start:], flags=re.IGNORECASE)
+def extract_section(text: str, start_headings: list[str], fallback: str) -> str:
+    """Extrai uma seção aproximada"""
+    text = normalize_text(text)
 
+    start_re = heading_regex(start_headings)
+    all_re = heading_regex(HEADINGS)
 
-def extract_region(
-    text: str,
-    start_headings: list[str],
-    end_headings: list[str],
-    fallback: str,
-) -> str:
-    """
-    Extract an approximate region from an article.
-
-    fallback options:
-    - "start": first third of the text
-    - "middle": whole text
-    - "end": last third of the text
-    """
-    text = normalize_spaces(text)
-
-    start_match = find_heading(text, start_headings)
+    start_match = start_re.search(text)
 
     if start_match:
-        start_position = start_match.start()
-        search_from = min(len(text), start_position + 80)
+        start = start_match.end()
+        next_match = all_re.search(text, pos=start + 60)
+        end = next_match.start() if next_match else len(text)
 
-        end_match = find_heading(text, end_headings, start=search_from)
+        section = text[start:end].strip()
 
-        if end_match:
-            end_position = search_from + end_match.start()
-
-            if end_position > start_position:
-                return text[start_position:end_position].strip()
-
-        return text[start_position:].strip()
+        if len(section) > 80:
+            return section
 
     if fallback == "start":
         return text[: int(len(text) * 0.35)]
+
+    if fallback == "middle":
+        return text[int(len(text) * 0.20): int(len(text) * 0.80)]
 
     if fallback == "end":
         return text[int(len(text) * 0.65):]
 
     return text
 
-
-# ---------------------------------------------------------------------------
-# Extraction patterns
-# ---------------------------------------------------------------------------
+# padrões
 
 OBJECTIVE_PATTERNS = [
-    (r"\bthe objective of (this|the) (paper|article|study|work|research) is\b", 10),
-    (r"\bthe aim of (this|the) (paper|article|study|work|research) is\b", 10),
-    (r"\bthe goal of (this|the) (paper|article|study|work|research) is\b", 9),
-    (r"\bthe purpose of (this|the) (paper|article|study|work|research) is\b", 9),
-    (r"\bthis (paper|article|study|work|research) aims to\b", 9),
-    (r"\bthis (paper|article|study|work|research) seeks to\b", 8),
-    (r"\bthis (paper|article|study|work|research) investigates\b", 7),
-    (r"\bthis (paper|article|study|work|research) explores\b", 7),
-    (r"\bin this (paper|article|study|work|research), we\b", 5),
-    (r"\bwe aim to\b", 8),
-    (r"\bwe seek to\b", 8),
-    (r"\bwe investigate\b", 7),
-    (r"\bwe examine\b", 7),
-    (r"\bwe explore\b", 7),
-    (r"\bwe analyze\b", 6),
-    (r"\bwe analyse\b", 6),
+    r"\bthe objective of this (paper|article|study|work|research) is\b",
+    r"\bthe aim of this (paper|article|study|work|research) is\b",
+    r"\bthe goal of this (paper|article|study|work|research) is\b",
+    r"\bthe purpose of this (paper|article|study|work|research) is\b",
+    r"\bthis (paper|article|study|work|research) aims to\b",
+    r"\bwe aim to\b",
+    r"\bin this (paper|article|study|work), we\b",
+    r"\bthis (paper|article|study|work|research) investigates\b",
+    r"\bthis (paper|article|study|work|research) explores\b",
+    r"\bthis (paper|article|study|work|research) examines\b",
 ]
 
 PROBLEM_PATTERNS = [
-    (r"\bresearch problem\b", 10),
-    (r"\bproblem\b", 7),
-    (r"\bchallenge\b", 7),
-    (r"\bchallenges\b", 7),
-    (r"\bgap\b", 7),
-    (r"\bgaps\b", 7),
-    (r"\blimitation\b", 6),
-    (r"\blimitations\b", 6),
-    (r"\black of\b", 7),
-    (r"\blacks\b", 6),
-    (r"\bthere is a need\b", 8),
-    (r"\bthere remains\b", 6),
-    (r"\bremains unclear\b", 8),
-    (r"\blittle is known\b", 8),
-    (r"\bnot well understood\b", 8),
-    (r"\bis difficult\b", 5),
-    (r"\bare difficult\b", 5),
-    (r"\bexisting (methods|approaches|studies|systems|solutions)\b", 4),
-    (r"\bhowever\b", 2),
-    (r"\bdespite\b", 2),
+    r"\bproblem\b",
+    r"\bchallenge\b",
+    r"\bissue\b",
+    r"\bgap\b",
+    r"\blimitation\b",
+    r"\black of\b",
+    r"\bthere is a need\b",
+    r"\bthere remains\b",
+    r"\blittle is known\b",
+    r"\bremains unclear\b",
+    r"\bis difficult\b",
+    r"\bfail to\b",
+    r"\bfails to\b",
+    r"\bdespite\b",
 ]
 
 METHOD_PATTERNS = [
-    (r"\bmethod\b", 5),
-    (r"\bmethods\b", 5),
-    (r"\bmethodology\b", 8),
-    (r"\bapproach\b", 5),
-    (r"\bframework\b", 5),
-    (r"\btechnique\b", 4),
-    (r"\balgorithm\b", 4),
-    (r"\bexperiment\b", 6),
-    (r"\bexperiments\b", 6),
-    (r"\bexperimental\b", 5),
-    (r"\bevaluation\b", 4),
-    (r"\bdataset\b", 6),
-    (r"\bcorpus\b", 6),
-    (r"\bparticipants\b", 6),
-    (r"\bquestionnaire\b", 7),
-    (r"\bsurvey\b", 7),
-    (r"\binterview\b", 7),
-    (r"\binterviews\b", 7),
-    (r"\bcontent analysis\b", 8),
-    (r"\bcase study\b", 7),
-    (r"\bwe conducted\b", 8),
-    (r"\bwe collected\b", 7),
-    (r"\bwe used\b", 6),
-    (r"\bwe designed\b", 6),
-    (r"\bwe developed\b", 6),
-    (r"\bwe implemented\b", 6),
+    r"\bmethod\b",
+    r"\bmethodology\b",
+    r"\bapproach\b",
+    r"\bframework\b",
+    r"\btechnique\b",
+    r"\balgorithm\b",
+    r"\bdataset\b",
+    r"\bcorpus\b",
+    r"\bexperiment\b",
+    r"\bevaluation\b",
+    r"\bparticipants?\b",
+    r"\binterviews?\b",
+    r"\bsurvey\b",
+    r"\bwe used\b",
+    r"\bwe conducted\b",
+    r"\bwe collected\b",
+    r"\bwe developed\b",
+    r"\bwe evaluated\b",
 ]
 
 CONTRIBUTION_PATTERNS = [
-    (r"\bcontributes to\b", 10),
-    (r"\bcontribute to\b", 10),
-    (r"\bcontribution\b", 9),
-    (r"\bcontributions\b", 9),
-    (r"\bmain contribution\b", 10),
-    (r"\bmain contributions\b", 10),
-    (r"\bwe contribute\b", 10),
-    (r"\bthis (paper|article|study|work|research) contributes\b", 10),
-    (r"\bthe contributions of (this|the) (paper|article|study|work|research)\b", 10),
-    (r"\bwe make the following contributions\b", 11),
-    (r"\bour findings\b", 5),
-    (r"\bour results\b", 4),
-    (r"\bwe provide\b", 5),
-    (r"\bwe offer\b", 5),
-    (r"\bwe demonstrate\b", 5),
-    (r"\bwe show\b", 4),
-    (r"\bnovel\b", 4),
-    (r"\bfor the first time\b", 6),
+    r"\bcontribution\b",
+    r"\bcontributions\b",
+    r"\bcontribute\b",
+    r"\bwe contribute\b",
+    r"\bwe propose\b",
+    r"\bwe present\b",
+    r"\bwe introduce\b",
+    r"\bwe provide\b",
+    r"\bwe demonstrate\b",
+    r"\bthis (paper|article|study|work) proposes\b",
+    r"\bthis (paper|article|study|work) presents\b",
+    r"\bthis (paper|article|study|work) introduces\b",
 ]
 
-AFFECTIVE_COMPUTING_BONUS = [
-    r"\baffective computing\b",
-    r"\bemotion recognition\b",
-    r"\bemotion detection\b",
-    r"\bemotion classification\b",
-    r"\bsentiment analysis\b",
-    r"\bfacial expression\b",
-    r"\bvalence\b",
-    r"\barousal\b",
-    r"\bphysiological signal",
-    r"\beeg\b",
-    r"\becg\b",
-    r"\bgaze\b",
-    r"\bmultimodal\b",
-    r"\bhuman-computer interaction\b",
-    r"\bhci\b",
+FUTURE_WORK_PATTERNS = [
+    r"\bfuture work\b",
+    r"\bfuture research\b",
+    r"\bfuture studies\b",
+    r"\bfuture direction\b",
+    r"\bfuture directions\b",
+    r"\bfurther work\b",
+    r"\bfurther research\b",
+    r"\bin the future\b",
+    r"\bwe plan to\b",
+    r"\bwe intend to\b",
 ]
 
+# Extração
 
-# ---------------------------------------------------------------------------
-# Scoring and extraction
-# ---------------------------------------------------------------------------
+def find_excerpts(text: str, patterns: list[str], limit: int = 2, exclude: list[str] | None = None) -> list[str]:
+    """Busca frases que casam com os padrões"""
+    sentences = split_text(text)
+    results = []
+    seen = set()
 
-def score_sentence(
-    sentence: str,
-    patterns: list[tuple[str, int]],
-    bonus_patterns: list[str] | None = None,
-) -> int:
-    """
-    Score a sentence according to category patterns.
-    """
-    score = 0
+    excluded = {
+        normalize_text(item).lower()[:180]
+        for item in (exclude or [])
+    }
 
-    for pattern, weight in patterns:
-        if re.search(pattern, sentence, flags=re.IGNORECASE):
-            score += weight
+    for i, sentence in enumerate(sentences):
+        if any(re.search(pattern, sentence, flags=re.IGNORECASE) for pattern in patterns):
+            excerpt = make_excerpt(sentences, i)
+            key = normalize_text(excerpt).lower()[:180]
 
-    if bonus_patterns:
-        for pattern in bonus_patterns:
-            if re.search(pattern, sentence, flags=re.IGNORECASE):
-                score += 2
+            if key not in seen and key not in excluded:
+                results.append(excerpt)
+                seen.add(key)
 
-    return score
+        if len(results) >= limit:
+            break
 
+    return results
 
-def select_candidate_sentences(
-    text: str,
-    patterns: list[tuple[str, int]],
-    limit: int,
-    bonus_patterns: list[str] | None = None,
-    forbidden: list[str] | None = None,
-) -> list[str]:
-    """
-    Select the highest scoring non-duplicated candidate sentences.
-    """
-    forbidden = forbidden or []
-    candidates: list[tuple[int, str]] = []
+def extract_info(paper: dict) -> dict:
+    """Extrai informações de um artigo já separado em regiões"""
+    intro = paper.get("intro_text", "") or paper.get("abstract", "")
+    method_text = paper.get("method_text", "") or paper.get("body_text", "")
+    conclusion = paper.get("conclusion_text", "")
+    body = paper.get("body_text", "")
 
-    for sentence in split_sentences(text):
-        if any(jaccard_similarity(sentence, blocked) >= 0.62 for blocked in forbidden):
-            continue
+    objective = find_excerpts(intro, OBJECTIVE_PATTERNS, limit=2)
 
-        score = score_sentence(sentence, patterns, bonus_patterns)
+    if not objective:
+        objective = find_excerpts(body, OBJECTIVE_PATTERNS, limit=1)
 
-        if score > 0:
-            candidates.append((score, sentence))
+    problem = find_excerpts(intro, PROBLEM_PATTERNS, limit=2)
 
-    candidates.sort(key=lambda item: item[0], reverse=True)
+    if not problem:
+        problem = find_excerpts(body, PROBLEM_PATTERNS, limit=1)
 
-    selected: list[str] = []
+    method = find_excerpts(method_text, METHOD_PATTERNS, limit=2)
 
-    for _, sentence in candidates:
-        append_if_unique(selected, sentence, limit)
+    if not method:
+        method = find_excerpts(body, METHOD_PATTERNS, limit=1)
 
-    return selected
-
-
-def extract_article_information(article_name: str, text: str) -> ExtractedArticleInfo:
-    """
-    Extract Step 2 information from one article text.
-    """
-    text = normalize_spaces(text)
-
-    introduction_text = extract_region(
-        text=text,
-        start_headings=INTRODUCTION_HEADINGS,
-        end_headings=COMMON_NEXT_HEADINGS,
-        fallback="start",
+    contribution = find_excerpts(
+        f"{intro} {conclusion}",
+        CONTRIBUTION_PATTERNS,
+        limit=3,
+        exclude=objective,
     )
 
-    method_text = extract_region(
-        text=text,
-        start_headings=METHOD_HEADINGS,
-        end_headings=[
-            "results",
-            "findings",
-            "discussion",
-            "evaluation",
-            "limitations",
-            "conclusion",
-            "conclusions",
+    if not contribution:
+        contribution = find_excerpts(
+            body,
+            CONTRIBUTION_PATTERNS,
+            limit=2,
+            exclude=objective,
+        )
+
+    future_work = find_excerpts(conclusion, FUTURE_WORK_PATTERNS, limit=3)
+
+    return {
+        "objective": objective,
+        "problem": problem,
+        "method": method,
+        "contribution": contribution,
+        "future_work": future_work,
+    }
+
+def categorize_article(text: str) -> dict:
+    """Separa o artigo em regiões aproximadas"""
+    body, references = split_references(text)
+
+    abstract = extract_section(body, ["abstract"], fallback="start")
+    intro = extract_section(body, ["introduction"], fallback="start")
+
+    method_text = extract_section(
+        body,
+        [
+            "method",
+            "methods",
+            "methodology",
+            "materials and methods",
+            "approach",
+            "proposed approach",
+            "experiment",
+            "experiments",
+            "experimental setup",
         ],
         fallback="middle",
     )
 
-    conclusion_text = extract_region(
-        text=text,
-        start_headings=CONCLUSION_HEADINGS,
-        end_headings=["references", "bibliography"],
+    future_work = extract_section(
+        body,
+        ["future work", "future research", "future studies", "future direction", "future directions"],
         fallback="end",
     )
 
-    objective = select_candidate_sentences(
-        text=introduction_text,
-        patterns=OBJECTIVE_PATTERNS,
-        limit=3,
-        bonus_patterns=AFFECTIVE_COMPUTING_BONUS,
+    conclusion = extract_section(
+        body,
+        ["conclusion", "conclusions", "final remarks"],
+        fallback="end",
     )
 
-    problem = select_candidate_sentences(
-        text=introduction_text,
-        patterns=PROBLEM_PATTERNS,
-        limit=3,
-        bonus_patterns=AFFECTIVE_COMPUTING_BONUS,
-    )
+    return {
+        "abstract": abstract,
+        "intro_text": intro,
+        "method_text": method_text,
+        "body_text": body,
+        "conclusion_text": conclusion,
+        "future_work_text": future_work,
+        "references": references,
+    }
 
-    method = select_candidate_sentences(
-        text=method_text,
-        patterns=METHOD_PATTERNS,
-        limit=3,
-        bonus_patterns=AFFECTIVE_COMPUTING_BONUS,
-    )
 
-    # Contributions often appear in the introduction and conclusion.
-    # We also block sentences already selected as objectives, because the work
-    # asks to distinguish contribution from objective.
-    contribution_text = f"{introduction_text} {conclusion_text}"
+def extract_article_information(article_name: str, text: str, references: list[str] | None = None) -> dict:
+    """Extrai as informações principais de um artigo"""
+    text = normalize_text(text)
+    paper = categorize_article(text)
 
-    contribution = select_candidate_sentences(
-        text=contribution_text,
-        patterns=CONTRIBUTION_PATTERNS,
-        limit=4,
-        bonus_patterns=AFFECTIVE_COMPUTING_BONUS,
-        forbidden=objective,
-    )
+    if references is not None:
+        paper["references"] = references
 
-    review_notes: list[str] = []
+    info = extract_info(paper)
 
-    if not objective:
+    review_notes = []
+
+    if not info["objective"]:
         review_notes.append("Objective not found automatically.")
-
-    if not problem:
-        review_notes.append("Problem or research gap not found automatically.")
-
-    if not method:
-        review_notes.append("Method or methodology not found automatically.")
-
-    if not contribution:
+    if not info["problem"]:
+        review_notes.append("Problem not found automatically.")
+    if not info["method"]:
+        review_notes.append("Method not found automatically.")
+    if not info["contribution"]:
         review_notes.append("Contribution not found automatically.")
 
-    return ExtractedArticleInfo(
-        article=article_name,
-        objective=objective,
-        problem=problem,
-        method=method,
-        contribution=contribution,
-        review_notes=review_notes,
-    )
+    return {
+        "article": article_name,
+        "objective": info["objective"],
+        "problem": info["problem"],
+        "method": info["method"],
+        "contribution": info["contribution"],
+        "future_work": info["future_work"],
+        "references": paper.get("references", []),
+        "review_notes": review_notes,
+    }
 
 
-def extract_information_for_corpus(texts_by_article: Mapping[Path | str, str]) -> dict[str, dict]:
-    """
-    Extract Step 2 information for multiple articles.
-
-    The input should be a dictionary where the key is a Path or article name
-    and the value is the article text without references.
-    """
-    results: dict[str, dict] = {}
+def extract_information_for_corpus(texts_by_article: Mapping[Path | str, str], references_by_article: Mapping[Path | str, list[str]] | None = None) -> dict[str, dict]:
+    """Aplica a extração em todos os artigos"""
+    references_by_article = references_by_article or {}
+    results = {}
 
     for article_id, text in texts_by_article.items():
-        if isinstance(article_id, Path):
-            article_name = article_id.stem
-        else:
-            article_name = Path(str(article_id)).stem
+        article_name = Path(str(article_id)).stem
 
-        extraction = extract_article_information(article_name, text)
-        results[article_name] = asdict(extraction)
+        references = (
+            references_by_article.get(article_id)
+            or references_by_article.get(str(article_id))
+            or references_by_article.get(article_name)
+            or []
+        )
+
+        results[article_name] = extract_article_information(article_name=article_name, text=text, references=references)
 
     return results
+
+def extract_corpus(corpus: Mapping[str, dict]) -> dict[str, dict]:
+    """Compatibilidade com corpus já categorizado"""
+    return {name: extract_info(paper) for name, paper in corpus.items()}

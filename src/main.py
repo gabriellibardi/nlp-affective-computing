@@ -1,29 +1,68 @@
-from pathlib import Path
+"""
+Ponto de entrada do pipeline de PLN para artigos científicos.
+
+Fluxo geral, inspirado no projeto de referência:
+
+1. leitura dos PDFs;
+2. limpeza e separação de referências;
+3. pré-processamento;
+4. bag-of-words, bigramas e trigramas;
+5. extração de objetivo, problema, metodologia, contribuição e trabalhos futuros;
+6. exportação da ontologia JSON-LD;
+7. geração automática dos gráficos a partir da ontologia.
+
+Uso:
+    python src/main.py
+"""
+
 from collections import Counter
+from pathlib import Path
+import nltk
 
 from pdf_reader import extract_text_from_pdf
-from preprocessing import (
-    clean_text,
-    remove_references,
-    tokenize,
-    remove_stopwords,
-    lemmatize_tokens,
-)
-from extraction import extract_information_for_corpus
-
+from preprocessing import clean_text, tokenize, remove_stopwords, lemmatize_tokens
+from extraction import extract_information_for_corpus, split_references
+from ontology import build_jsonld_corpus, ontology_summary, save_jsonld
+from visualization import generate_all_visualizations
 
 RAW_DIR = Path("./data/raw")
 PROCESSED_DIR = Path("./data/processed")
 NO_REFERENCES_DIR = Path("./data/no_references")
+OUTPUT_DIR = Path("./data/ontology")
+FIGURES_DIR = Path("./data/figures")
+ONTOLOGY_OUTPUT = OUTPUT_DIR / "articles_ontology.jsonld"
+
+def ensure_nltk_resources() -> None:
+    """Garante os recursos básicos do NLTK usados no projeto."""
+    resources = {
+        "corpora/stopwords": "stopwords",
+        "corpora/wordnet": "wordnet",
+        "corpora/omw-1.4": "omw-1.4",
+    }
+
+    for resource_path, package in resources.items():
+        try:
+            nltk.data.find(resource_path)
+        except LookupError:
+            nltk.download(package, quiet=True)
+
+
+def ngrams(tokens: list[str], n: int) -> Counter:
+    """Gera n-gramas simples a partir de uma lista de tokens"""
+    if len(tokens) < n:
+        return Counter()
+
+    grams = []
+    for i in range(len(tokens) - n + 1):
+        gram = tokens[i:i + n]
+        if len(set(gram)) > 1:
+            grams.append(" ".join(gram))
+
+    return Counter(grams)
 
 
 def get_processed_text(pdf_path: Path) -> str:
-    """
-    Obtém o texto limpo de um PDF.
-
-    Se o texto já foi processado anteriormente, ele é carregado
-    de data/processed. Caso contrário, o PDF é lido, limpo e salvo.
-    """
+    """Lê o PDF, limpa o texto e usa cache em data/processed"""
     output_path = PROCESSED_DIR / f"{pdf_path.stem}.txt"
 
     if output_path.exists():
@@ -31,124 +70,132 @@ def get_processed_text(pdf_path: Path) -> str:
 
     raw_text = extract_text_from_pdf(pdf_path)
     processed_text = clean_text(raw_text)
-
     output_path.write_text(processed_text, encoding="utf-8")
-
     return processed_text
 
 
-def get_text_without_references(name: str, processed_text: str) -> str:
-    """
-    Obtém o texto sem referências bibliográficas.
+def get_body_and_references(name: str, processed_text: str) -> tuple[str, list[str]]:
+    """Separa texto sem referências e referências"""
+    body_path = NO_REFERENCES_DIR / f"{name}.txt"
+    body, references = split_references(processed_text)
 
-    Se a versão sem referências já existe, ela é carregada.
-    Caso contrário, as referências são removidas e o resultado é salvo.
-    """
-    output_path = NO_REFERENCES_DIR / f"{name}.txt"
+    if body_path.exists():
+        body = body_path.read_text(encoding="utf-8")
+    else:
+        body_path.write_text(body, encoding="utf-8")
 
-    if output_path.exists():
-        return output_path.read_text(encoding="utf-8")
+    return body, references
 
-    text_without_references = remove_references(processed_text)
 
-    output_path.write_text(text_without_references, encoding="utf-8")
+def preprocess_body_text(body_text: str) -> list[str]:
+    """Executa tokenização, remoção de stopwords e lematização"""
+    tokens = tokenize(body_text)
+    tokens = remove_stopwords(tokens)
+    return lemmatize_tokens(tokens)
 
-    return text_without_references
+
+def format_top_terms(title: str, terms: list[tuple[str, int]]) -> str:
+    """Formata uma lista de termos frequentes em texto"""
+    lines = [title, "=" * len(title)]
+
+    if not terms:
+        lines.append("(sem dados)")
+        return "\n".join(lines)
+
+    max_freq = max(freq for _, freq in terms) or 1
+    for rank, (term, freq) in enumerate(terms, 1):
+        bar = "-" * min(int(freq / max_freq * 30), 30)
+        lines.append(f"{rank:2d}. {term:<35s} {freq:5d}  {bar}")
+
+    return "\n".join(lines)
+
+
+def print_stage(title: str) -> None:
+    print("\n" + "-" * 50)
+    print(title)
+    print("-" * 50)
 
 
 def main() -> None:
-    """
-    Etapas:
-    - Lê PDFs de data/raw.
-    - Salva textos limpos em data/processed.
-    - Salva textos sem referências em data/no_references.
-    - Tokeniza, remove stopwords e aplica lemmatizing.
-    - Executa a Etapa 2: extrai objetivo, problema, método e contribuição.
-    - Salva as extrações em data/extractions/step2_extractions.json.
-    """
-    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-    NO_REFERENCES_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_nltk_resources()
 
-    pdf_files = list(RAW_DIR.glob("*.pdf"))
+    for directory in [RAW_DIR, PROCESSED_DIR, NO_REFERENCES_DIR, OUTPUT_DIR, FIGURES_DIR]:
+        directory.mkdir(parents=True, exist_ok=True)
 
-    print(f"{len(pdf_files)} artigos encontrados")
+    print_stage("1 - Lendo PDFs")
+    pdf_files = sorted(RAW_DIR.glob("*.pdf"))
+    print(f"Artigos encontrados em {RAW_DIR}: {len(pdf_files)}")
 
-    texts_without_references = {}
-    all_lemmatized_tokens = []
+    texts_without_references: dict[Path, str] = {}
+    references_by_article: dict[Path, list[str]] = {}
+    tokens_by_article: dict[str, list[str]] = {}
+    simplified_categorized: dict[str, dict] = {}
+
+    all_tokens: list[str] = []
+    bow_global = Counter()
 
     for pdf_path in pdf_files:
         processed_text = get_processed_text(pdf_path)
+        body_text, references = get_body_and_references(pdf_path.stem, processed_text)
+        tokens = preprocess_body_text(body_text)
 
-        text_without_references = get_text_without_references(
-            pdf_path.stem,
-            processed_text,
-        )
+        texts_without_references[pdf_path] = body_text
+        references_by_article[pdf_path] = references
+        tokens_by_article[pdf_path.stem] = tokens
 
-        texts_without_references[pdf_path] = text_without_references
+        all_tokens.extend(tokens)
+        bow_global.update(tokens)
 
-        tokens = tokenize(text_without_references)
-        tokens = remove_stopwords(tokens)
-        lemmatized_tokens = lemmatize_tokens(tokens)
+        simplified_categorized[pdf_path.stem] = {
+            "filename": pdf_path.name,
+            "tokens": len(tokens),
+            "references": len(references),
+        }
 
-        all_lemmatized_tokens.extend(lemmatized_tokens)
+        print(f"- {pdf_path.name}: {len(tokens)} tokens | {len(references)} referências")
 
-        print(f"\n{pdf_path.stem}")
-        print(f"Tokens após lemmatizing: {len(lemmatized_tokens)}")
-        print(lemmatized_tokens[:50])
+    print_stage("2 - Modelos de linguagem: BoW")
 
-    print("\n" + "=" * 80)
-    print("10 termos mais frequentes nos artigos")
-    print("=" * 80)
+    top_uniterms = bow_global.most_common(10)
 
-    most_common_terms = Counter(all_lemmatized_tokens).most_common(10)
+    for term, freq in top_uniterms:
+        print(f"- {term:<35s} {freq:5d}")
 
-    for term, frequency in most_common_terms:
-        print(f"{term}: {frequency}")
+    print_stage("3 - Extraindo objetivo, problema, metodologia, contribuição e trabalhos futuros")
 
-    print("\n" + "=" * 80)
-    print("Etapa 2 - Extração de objetivo, problema, método e contribuição")
-    print("=" * 80)
+    step2_extractions = extract_information_for_corpus(texts_without_references, references_by_article=references_by_article)
 
-    step2_extractions = extract_information_for_corpus(texts_without_references)
+    for article_id, info in step2_extractions.items():
+        # Completa a saída categorizada simplificada com título e ano extraídos.
+        simplified_categorized.setdefault(article_id, {})
+        simplified_categorized[article_id].update({
+            "stage2_fields_found": sum(
+                1
+                for field in ["objective", "problem", "method", "contribution", "future_work"]
+                if info.get(field)
+            ),
+        })
 
-    for article_name, extraction in step2_extractions.items():
-        print("\n" + "=" * 100)
-        print(f"ARTIGO: {article_name}")
-        print("=" * 100)
+        print(article_id, f" - Campos extraídos: {simplified_categorized[article_id]['stage2_fields_found']}/5\n")
 
-        print("\nOBJETIVO:")
-        if extraction["objective"]:
-            for item in extraction["objective"]:
-                print(f"- {item}")
-        else:
-            print("- Não encontrado automaticamente.")
+    print_stage("4 - Construindo ontologia JSON-LD")
 
-        print("\nPROBLEMA:")
-        if extraction["problem"]:
-            for item in extraction["problem"]:
-                print(f"- {item}")
-        else:
-            print("- Não encontrado automaticamente.")
+    ontology = build_jsonld_corpus(extractions=step2_extractions, most_common_terms=top_uniterms, tokens_by_article=tokens_by_article)
+    save_jsonld(ontology, ONTOLOGY_OUTPUT)
 
-        print("\nMÉTODO / METODOLOGIA:")
-        if extraction["method"]:
-            for item in extraction["method"]:
-                print(f"- {item}")
-        else:
-            print("- Não encontrado automaticamente.")
+    print(ontology_summary(ontology))
+    print(f"\nOntologia salva em: {ONTOLOGY_OUTPUT}")
 
-        print("\nCONTRIBUIÇÃO:")
-        if extraction["contribution"]:
-            for item in extraction["contribution"]:
-                print(f"- {item}")
-        else:
-            print("- Não encontrado automaticamente.")
+    print_stage("5 - Gerando visualizações a partir da ontologia")
 
-        if extraction["review_notes"]:
-            print("\nAVISOS PARA REVISÃO MANUAL:")
-            for note in extraction["review_notes"]:
-                print(f"- {note}")
+    generated_figures = generate_all_visualizations(ontology_path=ONTOLOGY_OUTPUT, output_dir=FIGURES_DIR)
 
+    print("\nArquivos finais gerados:")
+    print(f"- {ONTOLOGY_OUTPUT}")
+
+    print("\nGráficos gerados:")
+    for path in generated_figures:
+        print(f"- {path}")
 
 if __name__ == "__main__":
     main()
