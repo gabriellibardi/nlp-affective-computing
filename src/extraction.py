@@ -7,8 +7,6 @@ Comportamento inspirado no arquivo de referência:
 3. divide em frases;
 4. busca trechos por padrões;
 5. retorna listas de trechos literais.
-
-Não utiliza modelos pré-treinados nem bibliotecas de machine learning.
 """
 
 import re
